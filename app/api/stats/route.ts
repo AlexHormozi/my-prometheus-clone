@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { createClient } from '@/lib/supabase/server'
 import { calculateScore } from '@/lib/scoring'
-import { subDays, format, startOfWeek, endOfWeek } from 'date-fns'
+import { subDays, format, startOfWeek } from 'date-fns'
 
 export async function GET(request: NextRequest) {
   try {
@@ -18,10 +18,11 @@ export async function GET(request: NextRequest) {
 
     const { data: partnership } = await supabase
       .from('partnerships')
-      .select('*')
-      .or(`user_a.eq.${user.id},user_b.eq.${user.id}`)
+      .select('user_a,user_b')
       .eq('status', 'active')
-      .single()
+      .or(`user_a.eq.${user.id},user_b.eq.${user.id}`)
+      .limit(1)
+      .maybeSingle()
 
     if (!partnership) {
       return NextResponse.json({ error: 'No active partnership' }, { status: 404 })
@@ -31,30 +32,41 @@ export async function GET(request: NextRequest) {
     const startDate = format(subDays(new Date(), days), 'yyyy-MM-dd')
 
     const [currentUserEntries, partnerEntries, currentUserPhotos, partnerPhotos, currentUserProfile, partnerProfile] = await Promise.all([
-      supabase.from('journal_entries').select('*').eq('user_id', user.id).gte('entry_date', startDate).order('entry_date'),
-      supabase.from('journal_entries').select('*').eq('user_id', partnerId).gte('entry_date', startDate).order('entry_date'),
-      supabase.from('entry_photos').select('*').eq('user_id', user.id),
-      supabase.from('entry_photos').select('*').eq('user_id', partnerId),
-      supabase.from('profiles').select('*').eq('id', user.id).single(),
-      supabase.from('profiles').select('*').eq('id', partnerId).single(),
+      supabase.from('journal_entries').select('id,entry_date,priorities,wins,blockers,minutes_deep_work,mood,tomorrow_plan,is_submitted').eq('user_id', user.id).gte('entry_date', startDate).order('entry_date'),
+      supabase.from('journal_entries').select('id,entry_date,priorities,wins,blockers,minutes_deep_work,mood,tomorrow_plan,is_submitted').eq('user_id', partnerId).gte('entry_date', startDate).order('entry_date'),
+      supabase.from('entry_photos').select('id,entry_id').eq('user_id', user.id).gte('created_at', new Date(startDate).toISOString()),
+      supabase.from('entry_photos').select('id,entry_id').eq('user_id', partnerId).gte('created_at', new Date(startDate).toISOString()),
+      supabase.from('profiles').select('id,display_name').eq('id', user.id).limit(1).maybeSingle(),
+      supabase.from('profiles').select('id,display_name').eq('id', partnerId).limit(1).maybeSingle(),
     ])
 
     const processUserStats = (entries: any[], photos: any[]) => {
-      const dailyScores = entries.map(entry => {
-        const entryPhotos = photos.filter(p => p.entry_id === entry.id)
-        const score = calculateScore(entry, entryPhotos)
-        return { date: entry.entry_date, score: score.total }
+      const photosByEntryId = new Map<string, number>()
+      photos.forEach(p => {
+        const count = photosByEntryId.get(p.entry_id) || 0
+        photosByEntryId.set(p.entry_id, count + 1)
       })
 
+      const entryByDate = new Map<string, any>()
+      const dailyScores: Array<{ date: string; score: number }> = []
       const weeklyScores: { [key: string]: number } = {}
-      entries.forEach(entry => {
-        const weekStart = format(startOfWeek(new Date(entry.entry_date)), 'yyyy-MM-dd')
-        const entryPhotos = photos.filter(p => p.entry_id === entry.id)
-        const score = calculateScore(entry, entryPhotos)
-        weeklyScores[weekStart] = (weeklyScores[weekStart] || 0) + score.total
-      })
+      let submittedCount = 0
+      let totalDeepWork = 0
+      let totalMood = 0
 
-      const weeklyScoresArray = Object.entries(weeklyScores).map(([week, score]) => ({ week, score }))
+      entries.forEach(entry => {
+        entryByDate.set(entry.entry_date, entry)
+        const photoCount = photosByEntryId.get(entry.id) || 0
+        const score = calculateScore(entry, Array(photoCount).fill({}))
+        dailyScores.push({ date: entry.entry_date, score: score.total })
+
+        const weekStart = format(startOfWeek(new Date(entry.entry_date)), 'yyyy-MM-dd')
+        weeklyScores[weekStart] = (weeklyScores[weekStart] || 0) + score.total
+
+        if (entry.is_submitted) submittedCount++
+        totalDeepWork += entry.minutes_deep_work || 0
+        totalMood += entry.mood || 0
+      })
 
       let currentStreak = 0
       let bestStreak = 0
@@ -63,7 +75,7 @@ export async function GET(request: NextRequest) {
 
       for (let i = 0; i < days; i++) {
         const checkDate = format(subDays(today, i), 'yyyy-MM-dd')
-        const hasEntry = entries.some(e => e.entry_date === checkDate && e.is_submitted)
+        const hasEntry = entryByDate.has(checkDate) && entryByDate.get(checkDate).is_submitted
         if (hasEntry) {
           tempStreak++
           if (i === 0 || currentStreak > 0) currentStreak = tempStreak
@@ -74,10 +86,9 @@ export async function GET(request: NextRequest) {
         }
       }
 
-      const submittedCount = entries.filter(e => e.is_submitted).length
       const completionRate = days > 0 ? Math.round((submittedCount / days) * 100) : 0
-      const totalDeepWork = entries.reduce((sum, e) => sum + (e.minutes_deep_work || 0), 0)
-      const avgMood = entries.length > 0 ? entries.reduce((sum, e) => sum + (e.mood || 0), 0) / entries.length : 0
+      const avgMood = entries.length > 0 ? Math.round((totalMood / entries.length) * 10) / 10 : 0
+      const weeklyScoresArray = Object.entries(weeklyScores).map(([week, score]) => ({ week, score }))
 
       return {
         dailyScores,
@@ -86,7 +97,7 @@ export async function GET(request: NextRequest) {
         bestStreak,
         completionRate,
         totalDeepWork,
-        averageMood: Math.round(avgMood * 10) / 10,
+        averageMood: avgMood,
       }
     }
 
